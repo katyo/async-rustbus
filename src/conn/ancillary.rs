@@ -1,19 +1,23 @@
-use std::convert::TryFrom;
-use std::io::{self, IoSlice, IoSliceMut};
-use std::marker::PhantomData;
-use std::mem::{size_of, zeroed};
-use std::os::unix::io::RawFd;
+use core::{
+    marker::PhantomData,
+    mem::{size_of, zeroed},
+    ptr::read_unaligned,
+    slice::from_raw_parts,
+};
+use std::{
+    io,
+    io::{IoSlice, IoSliceMut},
+    os::unix::io::RawFd,
+};
 
 #[cfg(target_os = "android")]
-use std::ptr::eq;
-use std::ptr::read_unaligned;
-use std::slice::from_raw_parts;
+use core::ptr::eq;
 
 pub(super) fn recv_vectored_with_ancillary(
     socket: RawFd,
     bufs: &mut [IoSliceMut<'_>],
     ancillary: &mut SocketAncillary<'_>,
-) -> std::io::Result<usize> {
+) -> io::Result<usize> {
     unsafe {
         let mut msg: libc::msghdr = zeroed();
         msg.msg_iov = bufs.as_mut_ptr().cast();
@@ -38,7 +42,7 @@ pub(super) fn recv_vectored_with_ancillary(
         let msg_ptr = &mut msg as *mut libc::msghdr;
         let recvd = libc::recvmsg(socket, msg_ptr, libc::MSG_CMSG_CLOEXEC);
         if recvd == -1 {
-            Err(std::io::Error::last_os_error())
+            Err(io::Error::last_os_error())
         } else {
             ancillary.length = msg.msg_controllen as usize;
             ancillary.truncated = msg.msg_flags & libc::MSG_CTRUNC == libc::MSG_CTRUNC;
@@ -80,7 +84,7 @@ pub(super) fn send_vectored_with_ancillary(
         let msg_ptr = &msg as *const libc::msghdr;
         let sent = libc::sendmsg(socket, msg_ptr, 0);
         if sent == -1 {
-            Err(std::io::Error::last_os_error())
+            Err(io::Error::last_os_error())
         } else {
             Ok(sent as usize)
         }
@@ -275,12 +279,12 @@ impl<'a> AncillaryData<'a> {
             ))]
             let cmsg_len_zero = libc::CMSG_LEN(0) as libc::socklen_t;
 
-            let data_len = (*cmsg).cmsg_len - cmsg_len_zero;
+            let data_len = cmsg.cmsg_len - cmsg_len_zero;
             let data = libc::CMSG_DATA(cmsg).cast();
             let data = from_raw_parts(data, data_len as usize);
 
-            match (*cmsg).cmsg_level {
-                libc::SOL_SOCKET => match (*cmsg).cmsg_type {
+            match cmsg.cmsg_level {
+                libc::SOL_SOCKET => match cmsg.cmsg_type {
                     libc::SCM_RIGHTS => Ok(AncillaryData::from_data(data)),
                     cmsg_type => Err(AncillaryError::Unknown {
                         cmsg_level: libc::SOL_SOCKET,
@@ -289,7 +293,7 @@ impl<'a> AncillaryData<'a> {
                 },
                 cmsg_level => Err(AncillaryError::Unknown {
                     cmsg_level,
-                    cmsg_type: (*cmsg).cmsg_type,
+                    cmsg_type: cmsg.cmsg_type,
                 }),
             }
         }

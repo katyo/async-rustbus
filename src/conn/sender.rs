@@ -1,14 +1,14 @@
-use std::collections::VecDeque;
-use std::io::{ErrorKind, IoSlice};
-use std::num::NonZeroU32;
-use std::sync::Arc;
+use core::num::NonZeroU32;
+use std::{
+    collections::VecDeque,
+    io,
+    io::{ErrorKind, IoSlice},
+    os::unix::io::RawFd,
+};
 
 use arrayvec::ArrayVec;
 
-use std::os::unix::io::RawFd;
-
-use crate::rustbus_core;
-use rustbus_core::message_builder::MarshalledMessage;
+use rustbus::message_builder::MarshalledMessage;
 
 use super::{GenStream, SocketAncillary, DBUS_MAX_FD_MESSAGE};
 
@@ -17,21 +17,22 @@ pub(crate) struct SendState {
     pub(super) idx: u64,
     pub(super) queue: VecDeque<RawOut>,
 }
+
 pub(super) struct RawOut {
     written: usize,
     header: Vec<u8>,
-    body: Arc<Vec<u8>>,
+    body: Vec<u8>,
     fds: Vec<RawFd>,
 }
+
 impl Drop for RawOut {
     fn drop(&mut self) {
         for fd in self.fds.iter() {
-            unsafe {
-                libc::close(*fd);
-            }
+            unsafe { libc::close(*fd) };
         }
     }
 }
+
 fn bufs_left<'a>(written: usize, header: &'a [u8], body: &'a [u8]) -> (&'a [u8], Option<&'a [u8]>) {
     if written < header.len() {
         let right = if body.is_empty() { None } else { Some(body) };
@@ -76,9 +77,9 @@ impl RawOut {
 /// to be written and fills the IoSlices for a vectored write.
 /// FDs sent in a write must be sent in a writee that only contains the correct message.
 /// This prevents the FDs from being associated with the wrong message.
-fn populate<'a, 'b, const N: usize>(
+fn populate<'a, const N: usize>(
     queue: &'a VecDeque<RawOut>,
-    ios: &'b mut ArrayVec<IoSlice<'a>, N>,
+    ios: &mut ArrayVec<IoSlice<'a>, N>,
     anc: &mut SocketAncillary,
 ) {
     for out in queue.iter() {
@@ -117,7 +118,7 @@ impl SendState {
     pub(crate) fn current_idx(&self) -> u64 {
         self.idx - self.queue.len() as u64
     }
-    pub(crate) fn finish_sending_next(&mut self, stream: &GenStream) -> std::io::Result<u64> {
+    pub(crate) fn finish_sending_next(&mut self, stream: &GenStream) -> io::Result<u64> {
         let mut anc_data = [0; 256];
         while !self.queue.is_empty() {
             let mut anc = SocketAncillary::new(&mut anc_data[..]);
@@ -143,28 +144,24 @@ impl SendState {
         stream: &GenStream,
         msg: &MarshalledMessage,
         serial: NonZeroU32,
-    ) -> std::io::Result<Option<u64>> {
+    ) -> io::Result<Option<u64>> {
         let mut header = Vec::with_capacity(1024);
-        msg.marshal_header(serial, &mut header).map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "Marshal Failure.")
-        })?;
-        let fds = msg.body.fds();
+        rustbus::wire::marshal::marshal(msg, serial.into(), &mut header)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Marshal Failure."))?;
+        let fds = msg.body.get_fds();
         if (!self.with_fd && !fds.is_empty()) || fds.len() > DBUS_MAX_FD_MESSAGE {
-            return Err(std::io::Error::new(
-                ErrorKind::InvalidInput,
-                "Too many Fds.",
-            ));
+            return Err(io::Error::new(ErrorKind::InvalidInput, "Too many Fds."));
         }
         let mut out = RawOut {
             header,
-            body: msg.body.buf_arc(),
+            body: msg.get_buf().into(),
             written: 0,
             fds: Vec::with_capacity(fds.len()),
         };
         for fd in fds {
-            let fd = fd.dup().map_err(|_| {
-                std::io::Error::new(ErrorKind::InvalidData, "Fds already consumed!")
-            })?;
+            let fd = fd
+                .dup()
+                .map_err(|_| io::Error::new(ErrorKind::InvalidData, "Fds already consumed!"))?;
             out.fds.push(fd.take_raw_fd().unwrap());
         }
         let mut anc_data = [0; 256];

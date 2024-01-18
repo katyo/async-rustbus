@@ -1,19 +1,19 @@
-use std::io::{ErrorKind, IoSliceMut};
-use std::mem;
-use std::net::Shutdown;
-use std::num::NonZeroU32;
-
-use crate::rustbus_core;
-use rustbus_core::message_builder::{DynamicHeader, MarshalledMessage, MarshalledMessageBody};
-use rustbus_core::wire::marshal::traits::SignatureBuffer;
-use rustbus_core::wire::util::align_offset;
-use rustbus_core::wire::{unmarshal, UnixFd};
-use unmarshal::traits::Unmarshal;
-use unmarshal::HEADER_LEN;
-
-use crate::utils::{align_num, parse_u32};
+use core::{mem, num::NonZeroU32};
+use rustbus::{
+    message_builder::{DynamicHeader, MarshalledMessage, MarshalledMessageBody},
+    wire::{
+        marshal::traits::SignatureBuffer, unmarshal, unmarshal::HEADER_LEN, util::align_offset,
+        UnixFd,
+    },
+};
+use std::{
+    io,
+    io::{ErrorKind, IoSliceMut},
+    net::Shutdown,
+};
 
 use super::{AncillaryData, GenStream, SocketAncillary, DBUS_MAX_FD_MESSAGE};
+use crate::utils::{align_num, parse_u32};
 
 pub enum InState {
     Header(Vec<u8>),
@@ -88,18 +88,17 @@ impl RecvState {
     fn try_get_msg(
         &mut self,
         stream: &GenStream,
-    ) -> std::io::Result<Option<(unmarshal::Header, DynamicHeader, Vec<u8>)>> {
+    ) -> io::Result<Option<(unmarshal::Header, DynamicHeader, Vec<u8>)>> {
         let mut try_block = || {
             match &mut self.in_state {
                 InState::Header(hdr_buf) => {
-                    use unmarshal::unmarshal_header;
                     if !extend_max(hdr_buf, &self.remaining, &mut self.rem_loc, HEADER_LEN) {
                         return Ok(None);
                     }
 
-                    let (_, hdr) = unmarshal_header(&hdr_buf[..], 0).map_err(|_e| {
+                    let (_, hdr) = unmarshal::unmarshal_header(&hdr_buf[..], 0).map_err(|_e| {
                         eprintln!("{:?} ({:?}", _e, hdr_buf);
-                        std::io::Error::new(ErrorKind::Other, "Bad header!")
+                        io::Error::new(ErrorKind::Other, "Bad header!")
                     })?;
                     self.in_state = InState::DynHdr(hdr, mem::take(hdr_buf));
                     self.try_get_msg(stream)
@@ -116,27 +115,21 @@ impl RecvState {
                     if !extend_max(dyn_buf, &self.remaining, &mut self.rem_loc, total_hdr_len) {
                         return Ok(None);
                     }
-                    let mut ctx = unmarshal::UnmarshalContext {
-                        byteorder: hdr.byteorder,
-                        offset: HEADER_LEN,
-                        buf: &dyn_buf[..],
-                        fds: &[],
-                    };
-                    let (used, mut dynhdr) = DynamicHeader::unmarshal(&mut ctx).map_err(|e| {
-                        std::io::Error::new(ErrorKind::Other, format!("Bad header!: {:?}", e))
-                    })?;
-                    drop(ctx);
+                    let (used, mut dynhdr) =
+                        unmarshal::unmarshal_dynamic_header(hdr, &dyn_buf[..], 0).map_err(|e| {
+                            io::Error::new(ErrorKind::Other, format!("Bad header!: {:?}", e))
+                        })?;
                     let serial = NonZeroU32::new(hdr.serial)
-                        .ok_or_else(|| std::io::Error::new(ErrorKind::Other, "Serial was zero!"))?;
-                    dynhdr.serial = Some(serial);
+                        .ok_or_else(|| io::Error::new(ErrorKind::Other, "Serial was zero!"))?;
+                    dynhdr.serial = Some(serial.into());
 
                     // DBus Spec says body is aligned to 8 bytes.
                     align_offset(8, &dyn_buf[..], HEADER_LEN + used)
-                        .map_err(|_| std::io::Error::new(ErrorKind::Other, "Data in offset!"))?;
+                        .map_err(|_| io::Error::new(ErrorKind::Other, "Data in offset!"))?;
 
                     // Validate dynhdr
                     if dynhdr.num_fds.unwrap_or(0) > 0 && !self.with_fd {
-                        return Err(std::io::Error::new(ErrorKind::Other, "Bad header!"));
+                        return Err(io::Error::new(ErrorKind::Other, "Bad header!"));
                     }
                     dyn_buf.clear();
                     dyn_buf.reserve(hdr.body_len as usize);
@@ -173,10 +166,7 @@ impl RecvState {
         }
     }
 
-    pub(crate) fn get_next_message(
-        &mut self,
-        stream: &GenStream,
-    ) -> std::io::Result<MarshalledMessage> {
+    pub(crate) fn get_next_message(&mut self, stream: &GenStream) -> io::Result<MarshalledMessage> {
         let res = self.try_get_msg(stream);
         if let Some((hdr, dynhdr, body)) = res? {
             let msg = mm_from_raw(hdr, dynhdr, body, Vec::new());
@@ -184,7 +174,7 @@ impl RecvState {
                 Ok(_) => return Ok(msg),
                 Err(e) => {
                     stream.shutdown(Shutdown::Both).ok();
-                    return Err(std::io::Error::new(
+                    return Err(io::Error::new(
                         ErrorKind::Other,
                         format!("Bad message body!: {:?}", e),
                     ));
@@ -221,7 +211,7 @@ impl RecvState {
                 Ok(0) | Err(_) => {
                     self.remaining = rem;
                     res?; // return if err otherwise return Hungup in case of Ok(0)
-                    return Err(std::io::Error::new(
+                    return Err(io::Error::new(
                         ErrorKind::BrokenPipe,
                         "DBus daemon hung up!",
                     ));
@@ -249,7 +239,7 @@ impl RecvState {
                     self.in_state = mem::take(&mut self.in_state).into_hdr();
                     self.in_fds.clear();
                     //TODO: Find better error
-                    return Err(std::io::Error::new(
+                    return Err(io::Error::new(
                         ErrorKind::Other,
                         "Too many unix fds received!",
                     ));
@@ -259,7 +249,7 @@ impl RecvState {
             if let Some((hdr, dynhdr, body)) = res? {
                 if self.in_fds.len() != dynhdr.num_fds.unwrap_or(0) as usize {
                     self.in_fds.clear();
-                    return Err(std::io::Error::new(
+                    return Err(io::Error::new(
                         ErrorKind::Other,
                         "Unepexted number of fds received!",
                     ));
@@ -269,7 +259,7 @@ impl RecvState {
                     Ok(_) => return Ok(msg),
                     Err(e) => {
                         stream.shutdown(Shutdown::Both).ok();
-                        return Err(std::io::Error::new(
+                        return Err(io::Error::new(
                             ErrorKind::Other,
                             format!("Bad message body!: {:?}", e),
                         ));
@@ -312,7 +302,7 @@ fn mm_from_raw(
     MarshalledMessage {
         typ: hdr.typ,
         flags: hdr.flags,
-        body: MarshalledMessageBody::from_parts(body, fds, sig, hdr.byteorder),
+        body: MarshalledMessageBody::from_parts(body, fds, sig.to_string(), hdr.byteorder),
         dynheader: dynhdr,
     }
 }

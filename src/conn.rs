@@ -3,26 +3,25 @@
 //! These are used to create `RpcConn`, the primary async connection of this crate.
 //! Most end-user of this library will never need to touch this module.
 
-use std::collections::{HashSet, VecDeque};
-use std::io::{IoSlice, IoSliceMut};
-use std::mem;
-use std::net::Shutdown;
-use std::num::NonZeroU32;
-use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
-use std::os::unix::net::UnixStream as StdUnixStream;
+use core::mem;
+use std::{
+    collections::{HashSet, VecDeque},
+    io,
+    io::{ErrorKind, IoSlice, IoSliceMut},
+    net::Shutdown,
+    num::NonZeroU32,
+    os::unix::{
+        io::{AsFd, AsRawFd, BorrowedFd, FromRawFd, RawFd},
+        net::UnixStream as StdUnixStream,
+    },
+    path::Path,
+};
 
-use tokio::io::*;
-use tokio::io::{AsyncRead, AsyncWrite};
+use futures_util::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use std::io::ErrorKind;
-use std::path::Path;
-use tokio::net::TcpStream;
-use tokio::net::ToSocketAddrs;
-use tokio::net::UnixStream;
+use async_net::{unix::UnixStream, AsyncToSocketAddrs as ToSocketAddrs, TcpStream};
 
-use super::rustbus_core;
-
-use rustbus_core::message_builder::MarshalledMessage;
+use rustbus::message_builder::MarshalledMessage;
 
 mod ancillary;
 
@@ -50,6 +49,12 @@ pub(crate) struct GenStream {
     fd: RawFd,
 }
 
+impl AsFd for GenStream {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        unsafe { BorrowedFd::borrow_raw(self.as_raw_fd()) }
+    }
+}
+
 impl AsRawFd for GenStream {
     fn as_raw_fd(&self) -> RawFd {
         self.fd
@@ -66,17 +71,17 @@ impl GenStream {
         &self,
         bufs: &mut [IoSliceMut<'_>],
         ancillary: &mut SocketAncillary<'_>,
-    ) -> std::io::Result<usize> {
+    ) -> io::Result<usize> {
         recv_vectored_with_ancillary(self.as_raw_fd(), bufs, ancillary)
     }
     fn send_vectored_with_ancillary(
         &self,
         bufs: &[IoSlice<'_>],
         ancillary: &mut SocketAncillary<'_>,
-    ) -> std::io::Result<usize> {
+    ) -> io::Result<usize> {
         send_vectored_with_ancillary(self.as_raw_fd(), bufs, ancillary)
     }
-    fn shutdown(&self, how: Shutdown) -> std::io::Result<()> {
+    fn shutdown(&self, how: Shutdown) -> io::Result<()> {
         let how = match how {
             Shutdown::Read => libc::SHUT_RD,
             Shutdown::Write => libc::SHUT_WR,
@@ -84,7 +89,7 @@ impl GenStream {
         };
         unsafe {
             if libc::shutdown(self.as_raw_fd(), how) == -1 {
-                Err(std::io::Error::last_os_error())
+                Err(io::Error::last_os_error())
             } else {
                 Ok(())
             }
@@ -111,9 +116,9 @@ pub struct Conn {
     pub(super) send_state: SendState,
     serial: u32,
 }
-fn fd_or_os_err(fd: i32) -> std::io::Result<i32> {
+fn fd_or_os_err(fd: i32) -> io::Result<i32> {
     if fd == -1 {
-        Err(std::io::Error::last_os_error())
+        Err(io::Error::last_os_error())
     } else {
         Ok(fd)
     }
@@ -121,22 +126,22 @@ fn fd_or_os_err(fd: i32) -> std::io::Result<i32> {
 // TODO: if https://github.com/async-rs/async-std/pull/961
 // is completed then perhaps this trait can be elimnated
 trait IntoRawFd {
-    fn into_raw_fd(self) -> std::io::Result<RawFd>;
+    fn into_raw_fd(self) -> io::Result<RawFd>;
 }
 impl<T: AsRawFd> IntoRawFd for T {
-    fn into_raw_fd(self) -> std::io::Result<RawFd> {
+    fn into_raw_fd(self) -> io::Result<RawFd> {
         let fd = self.as_raw_fd();
         unsafe { fd_or_os_err(libc::dup(fd)) }
     }
 }
 impl Conn {
-    async fn conn_handshake<T>(mut stream: T, with_fd: bool) -> std::io::Result<Self>
+    async fn conn_handshake<T>(mut stream: T, with_fd: bool) -> io::Result<Self>
     where
         T: AsyncRead + AsyncWrite + Unpin + IntoRawFd,
     {
         do_auth(&mut stream).await?;
         if with_fd && !negotiate_unix_fds(&mut stream).await? {
-            return Err(std::io::Error::new(
+            return Err(io::Error::new(
                 ErrorKind::ConnectionAborted,
                 "Failed to negotiate Unix FDs!",
             ));
@@ -168,12 +173,12 @@ impl Conn {
     pub async fn connect_to_addr<P: AsRef<Path>, S: ToSocketAddrs, B: AsRef<[u8]>>(
         addr: &DBusAddr<P, S, B>,
         with_fd: bool,
-    ) -> std::io::Result<Self> {
+    ) -> io::Result<Self> {
         match addr {
             DBusAddr::Path(p) => Self::conn_handshake(UnixStream::connect(p).await?, with_fd).await,
             DBusAddr::Tcp(s) => {
                 if with_fd {
-                    Err(std::io::Error::new(
+                    Err(io::Error::new(
                         ErrorKind::InvalidInput,
                         "Cannot use Fds over TCP.",
                     ))
@@ -196,7 +201,7 @@ impl Conn {
                 addr.sun_path
                     .get_mut(1..1 + buf.len())
                     .ok_or_else(|| {
-                        std::io::Error::new(
+                        io::Error::new(
                             ErrorKind::InvalidData,
                             "Abstract unix socket address was too long!",
                         )
@@ -213,31 +218,28 @@ impl Conn {
                     return Err(e);
                 }
                 let stream = StdUnixStream::from_raw_fd(fd);
-                let stream = UnixStream::from_std(stream)?;
+                let stream = UnixStream::try_from(stream)?;
                 Self::conn_handshake(stream, with_fd).await
             },
         }
     }
-    async fn connect_to_path_byteorder<P: AsRef<Path>>(
-        p: P,
-        with_fd: bool,
-    ) -> std::io::Result<Self> {
+    async fn connect_to_path_byteorder<P: AsRef<Path>>(p: P, with_fd: bool) -> io::Result<Self> {
         let addr = DBusAddr::unix_path(p);
         Self::connect_to_addr(&addr, with_fd).await
     }
-    pub async fn connect_to_path<P: AsRef<Path>>(p: P, with_fd: bool) -> std::io::Result<Self> {
+    pub async fn connect_to_path<P: AsRef<Path>>(p: P, with_fd: bool) -> io::Result<Self> {
         Self::connect_to_path_byteorder(p, with_fd).await
     }
-    pub fn get_next_message(&mut self) -> std::io::Result<MarshalledMessage> {
+    pub fn get_next_message(&mut self) -> io::Result<MarshalledMessage> {
         self.recv_state.get_next_message(&self.stream)
     }
-    pub fn finish_sending_next(&mut self) -> std::io::Result<u64> {
+    pub fn finish_sending_next(&mut self) -> io::Result<u64> {
         self.send_state.finish_sending_next(&self.stream)
     }
     pub fn write_next_message(
         &mut self,
         msg: &MarshalledMessage,
-    ) -> std::io::Result<(Option<u64>, Option<u32>)> {
+    ) -> io::Result<(Option<u64>, Option<u32>)> {
         self.serial += 1;
         let mut idx;
         loop {
@@ -269,7 +271,7 @@ fn find_line_ending(buf: &[u8]) -> Option<usize> {
 async fn starts_with<T: AsyncRead + AsyncWrite + Unpin>(
     buf: &[u8],
     stream: &mut T,
-) -> std::io::Result<Option<Vec<u8>>> {
+) -> io::Result<Option<Vec<u8>>> {
     debug_assert!(buf.len() <= 510);
     let mut pos = 0;
     let mut read_buf = [0; 512];
@@ -297,14 +299,14 @@ async fn starts_with<T: AsyncRead + AsyncWrite + Unpin>(
 }
 async fn find_auth_mechs<T: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut T,
-) -> std::io::Result<HashSet<String>> {
+) -> io::Result<HashSet<String>> {
     stream.write_all(b"AUTH\r\n").await?;
     let ret = starts_with(b"REJECTED", stream).await?;
     match ret {
         Some(s) if s.is_empty() => Ok(HashSet::new()),
         Some(s) => {
             let s = std::str::from_utf8(&s[..]).map_err(|_| {
-                std::io::Error::new(
+                io::Error::new(
                     ErrorKind::PermissionDenied,
                     "Invalid AUTH response from remote!",
                 )
@@ -315,18 +317,16 @@ async fn find_auth_mechs<T: AsyncRead + AsyncWrite + Unpin>(
         None => Ok(HashSet::new()), // TODO: Should this be an error?
     }
 }
-async fn await_ok<T: AsyncRead + AsyncWrite + Unpin>(stream: &mut T) -> std::io::Result<()> {
+async fn await_ok<T: AsyncRead + AsyncWrite + Unpin>(stream: &mut T) -> io::Result<()> {
     match starts_with(b"OK", stream).await? {
         Some(_) => Ok(()),
-        None => Err(std::io::Error::new(
+        None => Err(io::Error::new(
             ErrorKind::PermissionDenied,
             "External authentication failed with remote!",
         )),
     }
 }
-async fn do_external_auth<T: AsyncRead + AsyncWrite + Unpin>(
-    stream: &mut T,
-) -> std::io::Result<()> {
+async fn do_external_auth<T: AsyncRead + AsyncWrite + Unpin>(stream: &mut T) -> io::Result<()> {
     let mut to_write = Vec::from(&b"AUTH EXTERNAL "[..]);
     let mut pid = unsafe { libc::geteuid() };
     let mut order = 1;
@@ -348,11 +348,11 @@ async fn do_external_auth<T: AsyncRead + AsyncWrite + Unpin>(
     stream.write_all(&to_write).await?;
     await_ok(stream).await
 }
-async fn do_anon_auth<T: AsyncRead + AsyncWrite + Unpin>(stream: &mut T) -> std::io::Result<()> {
+async fn do_anon_auth<T: AsyncRead + AsyncWrite + Unpin>(stream: &mut T) -> io::Result<()> {
     stream.write_all(b"AUTH ANONYMOUS\r\n").await?;
     await_ok(stream).await
 }
-async fn do_auth<T: AsyncRead + AsyncWrite + Unpin>(stream: &mut T) -> std::io::Result<()> {
+async fn do_auth<T: AsyncRead + AsyncWrite + Unpin>(stream: &mut T) -> io::Result<()> {
     stream.write_all(b"\0").await?;
     let auth_mechs = find_auth_mechs(stream).await?;
     let mut err = None;
@@ -370,15 +370,13 @@ async fn do_auth<T: AsyncRead + AsyncWrite + Unpin>(stream: &mut T) -> std::io::
     }
     match err {
         Some(err) => Err(err),
-        None => Err(std::io::Error::new(
+        None => Err(io::Error::new(
             ErrorKind::PermissionDenied,
             "Remote doesn't support our auth methods!",
         )),
     }
 }
-async fn negotiate_unix_fds<T: AsyncRead + AsyncWrite + Unpin>(
-    stream: &mut T,
-) -> std::io::Result<bool> {
+async fn negotiate_unix_fds<T: AsyncRead + AsyncWrite + Unpin>(stream: &mut T) -> io::Result<bool> {
     stream.write_all(b"NEGOTIATE_UNIX_FD\r\n").await?;
     starts_with(b"AGREE_UNIX_FD", stream)
         .await

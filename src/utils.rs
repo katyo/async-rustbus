@@ -1,12 +1,12 @@
-use std::convert::TryInto;
-use std::ops::{Add, Rem, Sub};
-
-use futures::future::Either;
-use futures::prelude::*;
-use futures::task::{noop_waker_ref, Poll};
-
-use super::rustbus_core;
-use rustbus_core::ByteOrder;
+use core::{
+    future::Future,
+    ops::{Add, Rem, Sub},
+};
+use futures_util::{
+    future::{Either, FutureExt},
+    task::{noop_waker_ref, Poll},
+};
+use rustbus::ByteOrder;
 
 /*
 /// Expands a Vec from a slice by the minimum amount needed to

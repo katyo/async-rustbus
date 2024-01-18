@@ -1,10 +1,14 @@
-use std::collections::HashMap;
-use std::ffi::OsStr;
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
-
-use std::io::ErrorKind;
-use std::path::{Path, PathBuf};
-use tokio::net::ToSocketAddrs;
+use async_net::AsyncToSocketAddrs as ToSocketAddrs;
+use core::str;
+use std::{
+    collections::HashMap,
+    env,
+    ffi::OsStr,
+    io,
+    io::ErrorKind,
+    os::unix::ffi::{OsStrExt, OsStringExt},
+    path::{Path, PathBuf},
+};
 
 /// The filesystem path for all system DBuses.
 pub const DBUS_SYS_PATH: &str = "/run/dbus/system_bus_socket";
@@ -43,13 +47,12 @@ impl<B: AsRef<[u8]>> DBusAddr<&str, &str, B> {
 }
 
 /// Get the path of the system bus if it exists.
-pub async fn get_system_bus_addr() -> std::io::Result<DBusAddr<&'static Path, &'static str, [u8; 0]>>
-{
+pub async fn get_system_bus_addr() -> io::Result<DBusAddr<&'static Path, &'static str, [u8; 0]>> {
     let path = Path::new(DBUS_SYS_PATH);
     if path.exists() {
         Ok(DBusAddr::Path(path))
     } else {
-        Err(std::io::Error::new(
+        Err(io::Error::new(
             ErrorKind::NotFound,
             "Could not find system bus.",
         ))
@@ -57,13 +60,13 @@ pub async fn get_system_bus_addr() -> std::io::Result<DBusAddr<&'static Path, &'
 }
 
 const BAD_SESSION_ERR_MSG: &str = "Invalid session bus address in environment.";
-fn default_session_err() -> std::io::Error {
-    std::io::Error::new(ErrorKind::InvalidData, BAD_SESSION_ERR_MSG)
+fn default_session_err() -> io::Error {
+    io::Error::new(ErrorKind::InvalidData, BAD_SESSION_ERR_MSG)
 }
 /// Get and parse address of the session DBus from the environment.
-pub async fn get_session_bus_addr() -> std::io::Result<DBusAddr<PathBuf, String, Vec<u8>>> {
-    let bytes = std::env::var_os(DBUS_SESS_ENV)
-        .ok_or_else(|| std::io::Error::new(ErrorKind::NotFound, "No DBus session in environment."))?
+pub async fn get_session_bus_addr() -> io::Result<DBusAddr<PathBuf, String, Vec<u8>>> {
+    let bytes = env::var_os(DBUS_SESS_ENV)
+        .ok_or_else(|| io::Error::new(ErrorKind::NotFound, "No DBus session in environment."))?
         .into_vec();
     let mut iter = bytes.split(|b| *b == b':');
     let family = iter.next().unwrap();
@@ -97,7 +100,7 @@ pub async fn get_session_bus_addr() -> std::io::Result<DBusAddr<PathBuf, String,
                 return if path.exists() {
                     Ok(DBusAddr::Path(path.to_path_buf()))
                 } else {
-                    Err(std::io::Error::new(
+                    Err(io::Error::new(
                         ErrorKind::NotFound,
                         format!("Could not find session bus at {:?}.", path),
                     ))
@@ -108,9 +111,9 @@ pub async fn get_session_bus_addr() -> std::io::Result<DBusAddr<PathBuf, String,
         b"tcp" => {
             let addr = || {
                 let host_data = data_pairs.get(&b"host"[..])?;
-                let mut host_str = std::str::from_utf8(host_data).ok()?.to_string();
+                let mut host_str = str::from_utf8(host_data).ok()?.to_string();
                 let port_data = data_pairs.get(&b"port"[..])?;
-                let port_str = std::str::from_utf8(port_data).ok()?;
+                let port_str = str::from_utf8(port_data).ok()?;
                 host_str.push(':');
                 host_str.push_str(port_str);
                 Some(host_str)

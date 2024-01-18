@@ -1,18 +1,22 @@
-use std::cmp::Ordering as COrdering;
-use std::collections::hash_map::Iter;
-use std::collections::HashMap;
-use std::fmt::Write;
-use std::fmt::{Debug, Formatter};
-use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::Arc;
+use core::{
+    cmp::Ordering as COrdering,
+    fmt::{Debug, Formatter, Write},
+    mem::MaybeUninit,
+};
+use std::{
+    collections::{hash_map::Iter, HashMap},
+    path::Path,
+    sync::{
+        atomic::{AtomicU8, Ordering},
+        Arc,
+    },
+};
 
-use std::path::Path;
-
-use super::rustbus_core;
 use super::MsgQueue;
-use rustbus_core::message_builder::{MarshalledMessage, MessageType};
-use rustbus_core::path::ObjectPath;
+use rustbus::{
+    message_builder::{MarshalledMessage, MessageType},
+    wire::ObjectPath,
+};
 
 static mut MAP_TUPLE: (AtomicU8, MaybeUninit<HashMap<String, CallHierarchy>>) =
     (AtomicU8::new(0), MaybeUninit::uninit());
@@ -113,6 +117,7 @@ pub enum CallAction {
     /// This variant is primarily constructed by end users to nullify previously added actions.
     Nothing,
 }
+
 impl From<&CallHandler> for CallAction {
     fn from(handler: &CallHandler) -> Self {
         match handler {
@@ -124,6 +129,7 @@ impl From<&CallHandler> for CallAction {
         }
     }
 }
+
 impl CallHierarchy {
     pub fn new() -> Self {
         CallHierarchy {
@@ -132,8 +138,8 @@ impl CallHierarchy {
         }
     }
     pub fn send(&self, msg: MarshalledMessage) -> Result<(), MarshalledMessage> {
-        let path = ObjectPath::from_str(msg.dynheader.object.as_ref().unwrap()).unwrap();
-        let tar_comps = path.components();
+        let path = ObjectPath::new(msg.dynheader.object.as_ref().unwrap()).unwrap();
+        let tar_comps = path.as_ref().split('/');
         match self.send_inner(tar_comps) {
             Status::Queue(queue) => {
                 queue.send(msg);
@@ -209,8 +215,8 @@ impl CallHierarchy {
             }
         }
     }
-    pub fn insert_path(&mut self, path: &ObjectPath, handler: CallAction) {
-        let tar_comps = path.components();
+    pub fn insert_path<S: AsRef<str>>(&mut self, path: &ObjectPath<S>, handler: CallAction) {
+        let tar_comps = path.as_ref().split('/');
         self.insert_inner(tar_comps, handler);
     }
     fn find_inner<'a>(&self, mut tar_comps: impl Iterator<Item = &'a str>) -> Option<&CallHandler> {
@@ -219,15 +225,15 @@ impl CallHierarchy {
             None => Some(&self.handler),
         }
     }
-    fn find_handler(&self, path: &ObjectPath) -> Option<&CallHandler> {
-        let tar_comps = path.components();
+    fn find_handler<S: AsRef<str>>(&self, path: &ObjectPath<S>) -> Option<&CallHandler> {
+        let tar_comps = path.as_ref().split('/');
         self.find_inner(tar_comps)
     }
-    pub fn get_queue(&self, path: &ObjectPath) -> Option<&MsgQueue> {
+    pub fn get_queue<S: AsRef<str>>(&self, path: &ObjectPath<S>) -> Option<&MsgQueue> {
         let handler = self.find_handler(path)?;
         handler.get_queue()
     }
-    pub fn get_action(&self, path: &ObjectPath) -> Option<CallAction> {
+    pub fn get_action<S: AsRef<str>>(&self, path: &ObjectPath<S>) -> Option<CallAction> {
         let handler = self.find_handler(path)?;
         Some(handler.into())
     }
@@ -262,9 +268,13 @@ impl CallHierarchy {
             },
         }
     }
-    pub fn is_match(&self, org_path: &ObjectPath, msg_path: &ObjectPath) -> bool {
-        let org_comps = org_path.components();
-        let msg_comps = msg_path.components();
+    pub fn is_match<O: AsRef<str>, M: AsRef<str>>(
+        &self,
+        org_path: &ObjectPath<O>,
+        msg_path: &ObjectPath<M>,
+    ) -> bool {
+        let org_comps = org_path.as_ref().split('/');
+        let msg_comps = msg_path.as_ref().split('/');
         self.is_match_inner(org_comps, msg_comps)
     }
 }
@@ -618,87 +628,88 @@ pub fn queue_sig(sig_matches: &[MatchRule], sig: MarshalledMessage) {
 
 #[cfg(test)]
 mod tests {
-    use super::rustbus_core;
     use super::{CallAction, CallHierarchy, MatchRule, MsgQueue, EMPTY_MATCH};
-    use std::convert::TryInto;
 
     #[test]
     fn call_hierarchy_insert() {
         let mut hierarchy = CallHierarchy::new();
-        hierarchy.insert_path("/usr/local/bin".try_into().unwrap(), CallAction::Queue);
+        hierarchy.insert_path(&"/usr/local/bin".try_into().unwrap(), CallAction::Queue);
         assert_eq!(
             hierarchy
-                .get_action("/usr/local/bin".try_into().unwrap())
+                .get_action(&"/usr/local/bin".try_into().unwrap())
                 .unwrap(),
             CallAction::Queue
         );
         assert_eq!(
             hierarchy
-                .get_action("/usr/local".try_into().unwrap())
+                .get_action(&"/usr/local".try_into().unwrap())
                 .unwrap(),
             CallAction::Nothing
         );
         assert_eq!(
-            hierarchy.get_action("/usr".try_into().unwrap()).unwrap(),
+            hierarchy.get_action(&"/usr".try_into().unwrap()).unwrap(),
             CallAction::Nothing
         );
         assert_eq!(
-            hierarchy.get_action("/".try_into().unwrap()).unwrap(),
+            hierarchy.get_action(&"/".try_into().unwrap()).unwrap(),
             CallAction::Drop
         );
         assert!(hierarchy.is_match(
-            "/usr/local/bin".try_into().unwrap(),
-            "/usr/local/bin/echo".try_into().unwrap()
+            &"/usr/local/bin".try_into().unwrap(),
+            &"/usr/local/bin/echo".try_into().unwrap()
         ));
         assert!(hierarchy.is_match(
-            "/usr/local/bin".try_into().unwrap(),
-            "/usr/local/bin".try_into().unwrap()
+            &"/usr/local/bin".try_into().unwrap(),
+            &"/usr/local/bin".try_into().unwrap()
         ));
         assert!(!hierarchy.is_match(
-            "/usr/local".try_into().unwrap(),
-            "/usr/local".try_into().unwrap()
+            &"/usr/local".try_into().unwrap(),
+            &"/usr/local".try_into().unwrap()
         ));
-        assert!(!hierarchy.is_match("/usr".try_into().unwrap(), "/usr/local".try_into().unwrap()));
         assert!(!hierarchy.is_match(
-            "/".try_into().unwrap(),
-            "/usr/local/bin".try_into().unwrap()
+            &"/usr".try_into().unwrap(),
+            &"/usr/local".try_into().unwrap()
         ));
-        assert!(!hierarchy.is_match("/".try_into().unwrap(), "/usr/local".try_into().unwrap()));
-        hierarchy.insert_path("/".try_into().unwrap(), CallAction::Queue);
-        assert!(hierarchy.is_match("/".try_into().unwrap(), "/usr/local".try_into().unwrap()));
-        hierarchy.insert_path("/var".try_into().unwrap(), CallAction::Exact);
-        hierarchy.insert_path("/var/log/journal".try_into().unwrap(), CallAction::Queue);
+        assert!(!hierarchy.is_match(
+            &"/".try_into().unwrap(),
+            &"/usr/local/bin".try_into().unwrap()
+        ));
+        assert!(!hierarchy.is_match(&"/".try_into().unwrap(), &"/usr/local".try_into().unwrap()));
+        hierarchy.insert_path(&"/".try_into().unwrap(), CallAction::Queue);
+        assert!(hierarchy.is_match(&"/".try_into().unwrap(), &"/usr/local".try_into().unwrap()));
+        hierarchy.insert_path(&"/var".try_into().unwrap(), CallAction::Exact);
+        hierarchy.insert_path(&"/var/log/journal".try_into().unwrap(), CallAction::Queue);
         assert!(hierarchy.is_match(
-            "/var/log/journal".try_into().unwrap(),
-            "/var/log/journal".try_into().unwrap()
+            &"/var/log/journal".try_into().unwrap(),
+            &"/var/log/journal".try_into().unwrap()
         ));
-        assert!(hierarchy.is_match("/var".try_into().unwrap(), "/var/log".try_into().unwrap()));
-        assert!(!hierarchy.is_match("/".try_into().unwrap(), "/var/log".try_into().unwrap()));
-        assert!(!hierarchy.is_match("/".try_into().unwrap(), "/var".try_into().unwrap()));
+        assert!(hierarchy.is_match(&"/var".try_into().unwrap(), &"/var/log".try_into().unwrap()));
+        assert!(!hierarchy.is_match(&"/".try_into().unwrap(), &"/var/log".try_into().unwrap()));
+        assert!(!hierarchy.is_match(&"/".try_into().unwrap(), &"/var".try_into().unwrap()));
     }
     #[test]
     fn trimming() {
         let mut hierarchy = CallHierarchy::new();
-        hierarchy.insert_path("/usr/local/bin".try_into().unwrap(), CallAction::Queue);
+        hierarchy.insert_path(&"/usr/local/bin".try_into().unwrap(), CallAction::Queue);
         hierarchy.insert_path(
-            "/usr/local/bin/hello/find".try_into().unwrap(),
+            &"/usr/local/bin/hello/find".try_into().unwrap(),
             CallAction::Queue,
         );
         hierarchy.insert_path(
-            "/usr/local/bin/hello/find".try_into().unwrap(),
+            &"/usr/local/bin/hello/find".try_into().unwrap(),
             CallAction::Nothing,
         );
-        hierarchy.insert_path("/usr/local/bin".try_into().unwrap(), CallAction::Nothing);
+        hierarchy.insert_path(&"/usr/local/bin".try_into().unwrap(), CallAction::Nothing);
         println!("{:#?}", hierarchy);
         assert!(hierarchy.children.is_empty());
-        hierarchy.insert_path("/usr/local/bin".try_into().unwrap(), CallAction::Queue);
+        hierarchy.insert_path(&"/usr/local/bin".try_into().unwrap(), CallAction::Queue);
         hierarchy.insert_path(
-            "/usr/local/bin/hello/find".try_into().unwrap(),
+            &"/usr/local/bin/hello/find".try_into().unwrap(),
             CallAction::Queue,
         );
-        hierarchy.insert_path("/usr/local/bin".try_into().unwrap(), CallAction::Nothing);
+        hierarchy.insert_path(&"/usr/local/bin".try_into().unwrap(), CallAction::Nothing);
         hierarchy.insert_path(
-            "/usr/local/bin/hello/find".try_into().unwrap(),
+            &"/usr/local/bin/hello/find".try_into().unwrap(),
             CallAction::Nothing,
         );
         assert!(hierarchy.children.is_empty());
@@ -738,7 +749,7 @@ mod tests {
         assert!(std::ptr::eq(&w_interface, array[4]));
         assert!(std::ptr::eq(&w_member, array[5]));
     }
-    use rustbus_core::message_builder::MessageBuilder;
+    use rustbus::message_builder::MessageBuilder;
     #[test]
     fn matches_single() {
         let m1 = MatchRule::new().interface("io.test.Test1").clone();

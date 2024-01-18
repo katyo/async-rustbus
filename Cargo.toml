@@ -10,13 +10,18 @@ homepage = "https://github.com/cmaves/async-rustbus"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-libc = "0.2.126"
-rustbus = "0.17.0"
-tokio = {version = "1.31.0", features = ["rt", "rt-multi-thread", "sync", "time", "net", "io-util", "macros"]}
-async-channel = "1.9.0"
-arrayvec = "0.7.0"
-futures = "0.3.13"
-xml-rs = "0.8.4"
+libc = "0.2"
+rustbus = "0.19"
+async-channel = "2"
+async-io = "2"
+async-net = "2"
+arrayvec = "0.7"
+xml-rs = "0.8"
 
-[dev-dependencies]
-rand = { version = "0.8", features = ["small_rng"] }
+[dependencies.futures-util]
+version = "0.3"
+features = ["io"]
+
+[dev-dependencies.rand]
+version = "0.8"
+features = ["small_rng"]
